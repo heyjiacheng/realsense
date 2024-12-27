@@ -1,0 +1,32 @@
+[project]
+name = "realsense"
+version = "1.0.0"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+
+dependencies = [
+"pyrealsense2",
+"numpy",
+"threadpoolctl",
+"shared_memory@git+https://github.com/jc211/shared_memory"
+]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.build-dependencies]
+pip = "*"
+
+[tool.pixi.pypi-dependencies]
+realsense = { path = ".", editable = true }
+
+[tool.pixi.dependencies]
+ffmpeg = "*"
