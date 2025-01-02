@@ -186,10 +186,10 @@ class MultiRealsense:
             self.set_color_option(rs.option.white_balance, white_balance)
 
     def get_intrinsics(self):
-        return np.array({serial: c.get_intrinsics() for serial, c in self.cameras.items()})
+        return {serial: c.get_intrinsics() for serial, c in self.cameras.items()}
 
     def get_depth_scale(self):
-        return np.array({serial: c.get_depth_scale() for serial, c in self.cameras.items()})
+        return {serial: c.get_depth_scale() for serial, c in self.cameras.items()}
     
     def allocate_empty(self):
         return {serial: c.allocate_empty() for serial, c in self.cameras.items()}

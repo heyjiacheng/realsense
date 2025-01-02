@@ -1263,8 +1263,8 @@ packages:
   timestamp: 1679532220005
 - pypi: .
   name: realsense
-  version: 1.0.0
-  sha256: b9fb64ef9abac1420ceb7aabae6c2b7a6c4c7d0814671126b3db79b8773eefef
+  version: 1.0.1
+  sha256: e58b86b9004c0aec60750b1bafae29be81fdb8468f0841cd6d9503d8a407d417
   requires_dist:
   - pyrealsense2
   - numpy
