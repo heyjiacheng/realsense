@@ -46,7 +46,7 @@ class MultiRealsense:
 
         video_recorder = repeat_to_list(video_recorder, n_cameras, VideoRecorder)
 
-        cameras = dict()
+        cameras: dict[str, SingleRealsense] = dict()
         for i, serial in enumerate(serial_numbers):
             cameras[serial] = SingleRealsense(
                 shm_manager=shm_manager,
@@ -190,7 +190,7 @@ class MultiRealsense:
 
     def get_depth_scale(self):
         return {serial: c.get_depth_scale() for serial, c in self.cameras.items()}
-    
+
     def allocate_empty(self):
         return {serial: c.allocate_empty() for serial, c in self.cameras.items()}
 
