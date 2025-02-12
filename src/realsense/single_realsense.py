@@ -254,7 +254,7 @@ class SingleRealsense(mp.Process):
         assert self.ready_event.is_set()
         scale = self.intrinsics_array.get()[-1]
         return scale
-    
+
     def allocate_empty(self, k=None):
         return self.ring_buffer._allocate_empty(k=k)
 
@@ -390,12 +390,22 @@ class SingleRealsense(mp.Process):
                         # put_data['timestamp'] = put_start_time + step_idx / self.put_fps
                         put_data["timestamp"] = receive_time
                         # print(step_idx, data['timestamp'])
-                        self.ring_buffer.put(put_data, wait=False)
+                        try:
+                            self.ring_buffer.put(put_data, wait=False)
+                        except TimeoutError as e:
+                            print(
+                                f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+                            )
                 else:
                     step_idx = int((receive_time - put_start_time) * self.put_fps)
                     put_data["step_idx"] = step_idx
                     put_data["timestamp"] = receive_time
-                    self.ring_buffer.put(put_data, wait=False)
+                    try:
+                        self.ring_buffer.put(put_data, wait=False)
+                    except TimeoutError as e:
+                        print(
+                            f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+                        )
 
                 # signal ready
                 if iter_idx == 0:
@@ -479,5 +489,3 @@ class SingleRealsense(mp.Process):
 
         if self.verbose:
             print(f"[SingleRealsense {self.serial_number}] Exiting worker process.")
-
-

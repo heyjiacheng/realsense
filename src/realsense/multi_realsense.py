@@ -194,18 +194,20 @@ class MultiRealsense:
     def allocate_empty(self):
         return {serial: c.allocate_empty() for serial, c in self.cameras.items()}
 
-    def start_recording(self, video_path: Union[str, List[str]], start_time: float):
-        if isinstance(video_path, str):
-            # directory
-            video_dir = pathlib.Path(video_path)
-            assert video_dir.parent.is_dir()
-            video_dir.mkdir(parents=True, exist_ok=True)
-            video_path = list()
-            for i in range(self.n_cameras):
-                video_path.append(str(video_dir.joinpath(f"{i}.mp4").absolute()))
-        assert len(video_path) == self.n_cameras
+    def start_recording(self, video_path: str, start_time: float):
+        # if isinstance(video_path, str):
+        #     # directory
+        #     video_dir = pathlib.Path(video_path)
+        #     assert video_dir.parent.is_dir()
+        #     video_dir.mkdir(parents=True, exist_ok=True)
+        #     video_path = list()
+        #     for i in range(self.n_cameras):
+        #         video_path.append(str(video_dir.joinpath(f"{i}.mp4").absolute()))
+        # assert len(video_path) == self.n_cameras
 
-        for i, camera in enumerate(self.cameras.values()):
+        for serial, camera in self.cameras.items():
+            if isinstance(video_path, str):
+                video_path = str(video_dir.joinpath(f"{serial}.mp4").absolute())
             camera.start_recording(video_path[i], start_time)
 
     def stop_recording(self):
