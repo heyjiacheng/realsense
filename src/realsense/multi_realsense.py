@@ -206,6 +206,7 @@ class MultiRealsense:
         # assert len(video_path) == self.n_cameras
 
         video_dir = pathlib.Path(video_path)
+        video_dir.mkdir(parents=True, exist_ok=True)
         for serial, camera in self.cameras.items():
             if isinstance(video_path, str):
                 video_path = str(video_dir.joinpath(f"{serial}.mp4").absolute())
