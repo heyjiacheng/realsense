@@ -205,10 +205,11 @@ class MultiRealsense:
         #         video_path.append(str(video_dir.joinpath(f"{i}.mp4").absolute()))
         # assert len(video_path) == self.n_cameras
 
+        video_dir = pathlib.Path(video_path)
         for serial, camera in self.cameras.items():
             if isinstance(video_path, str):
                 video_path = str(video_dir.joinpath(f"{serial}.mp4").absolute())
-            camera.start_recording(video_path[i], start_time)
+            camera.start_recording(video_path, start_time)
 
     def stop_recording(self):
         for i, camera in enumerate(self.cameras.values()):
