@@ -11,7 +11,7 @@ def main():
     )
     realsenses.start()
     # data = realsenses.allocate_empty()
-    realsenses.start_recording("scripts/test", 0.0)
+    realsenses.start_recording("scripts/test", time.time())
     time.sleep(4)
     print("Done")
     realsenses.stop_recording()

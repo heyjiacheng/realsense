@@ -1,4 +1,6 @@
 from typing import Optional, Callable, Dict
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import enum
 import time
 import json
@@ -258,6 +260,17 @@ class SingleRealsense(mp.Process):
             }
         )
 
+    def save_metadata(self, path: Path):
+        data = {
+            "serial": self.serial_number,
+            "K": self.get_intrinsics().tolist(),
+            "resolution": self.resolution,
+            "timestamps": self.video_recorder.timestamps.copy(),
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f)
+
     def stop_recording(self):
         self.command_queue.put({"cmd": Command.STOP_RECORDING.value})
 
@@ -331,150 +344,159 @@ class SingleRealsense(mp.Process):
 
             iter_idx = 0
             t_start = time.time()
-            while not self.stop_event.is_set():
-                # wait for frames to come in
-                frameset = pipeline.wait_for_frames()
-                receive_time = time.time()
-                # align frames to color
-                frameset = align.process(frameset)
+            with ThreadPoolExecutor(max_workers=2) as exec:
+                while not self.stop_event.is_set():
+                    # wait for frames to come in
+                    frameset = pipeline.wait_for_frames()
+                    receive_time = time.time()
+                    # align frames to color
+                    frameset = align.process(frameset)
 
-                # grab data
-                data = dict()
-                data["camera_receive_timestamp"] = receive_time
-                # realsense report in ms
-                data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
-                if self.enable_color:
-                    color_frame = frameset.get_color_frame()
-                    data["color"] = np.asarray(color_frame.get_data())
-                    t = color_frame.get_timestamp() / 1000
-                    data["camera_capture_timestamp"] = t
-                    # print('device', time.time() - t)
-                    # print(color_frame.get_frame_timestamp_domain())
-                if self.enable_depth:
-                    data["depth"] = np.asarray(frameset.get_depth_frame().get_data())
-                if self.enable_infrared:
-                    data["infrared"] = np.asarray(
-                        frameset.get_infrared_frame().get_data()
-                    )
+                    # grab data
+                    data = dict()
+                    data["camera_receive_timestamp"] = receive_time
+                    # realsense report in ms
+                    data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
+                    if self.enable_color:
+                        color_frame = frameset.get_color_frame()
+                        data["color"] = np.asarray(color_frame.get_data())
+                        t = color_frame.get_timestamp() / 1000
+                        data["camera_capture_timestamp"] = t
+                        # print('device', time.time() - t)
+                        # print(color_frame.get_frame_timestamp_domain())
+                    if self.enable_depth:
+                        data["depth"] = np.asarray(
+                            frameset.get_depth_frame().get_data()
+                        )
+                    if self.enable_infrared:
+                        data["infrared"] = np.asarray(
+                            frameset.get_infrared_frame().get_data()
+                        )
 
-                # apply transform
-                put_data = data
-                if self.transform is not None:
-                    put_data = self.transform(dict(data))
+                    # apply transform
+                    put_data = data
+                    if self.transform is not None:
+                        put_data = self.transform(dict(data))
 
-                if self.put_downsample:
-                    # put frequency regulation
-                    local_idxs, global_idxs, put_idx = get_accumulate_timestamp_idxs(
-                        timestamps=[receive_time],
-                        start_time=put_start_time,
-                        dt=1 / self.put_fps,
-                        # this is non in first iteration
-                        # and then replaced with a concrete number
-                        next_global_idx=put_idx,
-                        # continue to pump frames even if not started.
-                        # start_time is simply used to align timestamps.
-                        allow_negative=True,
-                    )
+                    if self.put_downsample:
+                        # put frequency regulation
+                        local_idxs, global_idxs, put_idx = (
+                            get_accumulate_timestamp_idxs(
+                                timestamps=[receive_time],
+                                start_time=put_start_time,
+                                dt=1 / self.put_fps,
+                                # this is non in first iteration
+                                # and then replaced with a concrete number
+                                next_global_idx=put_idx,
+                                # continue to pump frames even if not started.
+                                # start_time is simply used to align timestamps.
+                                allow_negative=True,
+                            )
+                        )
 
-                    for step_idx in global_idxs:
+                        for step_idx in global_idxs:
+                            put_data["step_idx"] = step_idx
+                            # put_data['timestamp'] = put_start_time + step_idx / self.put_fps
+                            put_data["timestamp"] = receive_time
+                            # print(step_idx, data['timestamp'])
+                            try:
+                                self.ring_buffer.put(put_data, wait=False)
+                            except TimeoutError as e:
+                                print(
+                                    f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+                                )
+                    else:
+                        step_idx = int((receive_time - put_start_time) * self.put_fps)
                         put_data["step_idx"] = step_idx
-                        # put_data['timestamp'] = put_start_time + step_idx / self.put_fps
                         put_data["timestamp"] = receive_time
-                        # print(step_idx, data['timestamp'])
                         try:
                             self.ring_buffer.put(put_data, wait=False)
                         except TimeoutError as e:
                             print(
                                 f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
                             )
-                else:
-                    step_idx = int((receive_time - put_start_time) * self.put_fps)
-                    put_data["step_idx"] = step_idx
-                    put_data["timestamp"] = receive_time
-                    try:
-                        self.ring_buffer.put(put_data, wait=False)
-                    except TimeoutError as e:
-                        print(
-                            f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+
+                    # signal ready
+                    if iter_idx == 0:
+                        self.ready_event.set()
+
+                    # put to vis
+                    vis_data = data
+                    if self.vis_transform == self.transform:
+                        vis_data = put_data
+                    elif self.vis_transform is not None:
+                        vis_data = self.vis_transform(dict(data))
+                    self.vis_ring_buffer.put(vis_data, wait=False)
+
+                    # record frame
+                    rec_data = data
+                    if self.recording_transform == self.transform:
+                        rec_data = put_data
+                    elif self.recording_transform is not None:
+                        rec_data = self.recording_transform(dict(data))
+
+                    if self.video_recorder.is_ready():
+                        self.video_recorder.write_frame(
+                            rec_data["color"],
+                            frame_time=receive_time - self.record_start_time,
                         )
 
-                # signal ready
-                if iter_idx == 0:
-                    self.ready_event.set()
+                    # perf
+                    t_end = time.time()
+                    duration = t_end - t_start
+                    frequency = np.round(1 / duration, 1)
+                    t_start = t_end
+                    if self.verbose:
+                        print(f"[SingleRealsense {self.serial_number}] FPS {frequency}")
 
-                # put to vis
-                vis_data = data
-                if self.vis_transform == self.transform:
-                    vis_data = put_data
-                elif self.vis_transform is not None:
-                    vis_data = self.vis_transform(dict(data))
-                self.vis_ring_buffer.put(vis_data, wait=False)
+                    # fetch command from queue
+                    try:
+                        commands = self.command_queue.get_all()
+                        n_cmd = len(commands["cmd"])
+                    except Empty:
+                        n_cmd = 0
 
-                # record frame
-                rec_data = data
-                if self.recording_transform == self.transform:
-                    rec_data = put_data
-                elif self.recording_transform is not None:
-                    rec_data = self.recording_transform(dict(data))
+                    # execute commands
+                    for i in range(n_cmd):
+                        command = dict()
+                        for key, value in commands.items():  # type: ignore
+                            command[key] = value[i]
+                        cmd = command["cmd"]
+                        if cmd == Command.SET_COLOR_OPTION.value:
+                            sensor = pipeline_profile.get_device().first_color_sensor()
+                            option = rs.option(command["option_enum"])
+                            value = float(command["option_value"])
+                            sensor.set_option(option, value)
+                            # print('auto', sensor.get_option(rs.option.enable_auto_exposure))
+                            # print('exposure', sensor.get_option(rs.option.exposure))
+                            # print('gain', sensor.get_option(rs.option.gain))
+                        elif cmd == Command.SET_DEPTH_OPTION.value:
+                            sensor = pipeline_profile.get_device().first_depth_sensor()
+                            option = rs.option(command["option_enum"])
+                            value = float(command["option_value"])
+                            sensor.set_option(option, value)
+                        elif cmd == Command.START_RECORDING.value:
+                            video_path = str(command["video_path"])
+                            start_time = command["recording_start_time"]
+                            self.recording_stopped.clear()
+                            self.record_start_time = start_time
+                            self.video_recorder.start(video_path)
+                        elif cmd == Command.STOP_RECORDING.value:
+                            self.video_recorder.stop()
+                            assert self.video_recorder.path is not None
+                            exec.submit(
+                                self.save_metadata,
+                                self.video_recorder.path.with_suffix(".json"),
+                            )
+                            # stop need to flush all in-flight frames to disk, which might take longer than dt.
+                            # soft-reset put to drop frames to prevent ring buffer overflow.
+                            put_idx = None
+                        elif cmd == Command.RESTART_PUT.value:
+                            put_idx = None
+                            put_start_time = command["put_start_time"]
+                            # self.ring_buffer.clear()
 
-                if self.video_recorder.is_ready():
-                    self.video_recorder.write_frame(
-                        rec_data["color"],
-                        frame_time=receive_time - self.record_start_time,
-                    )
-
-                # perf
-                t_end = time.time()
-                duration = t_end - t_start
-                frequency = np.round(1 / duration, 1)
-                t_start = t_end
-                if self.verbose:
-                    print(f"[SingleRealsense {self.serial_number}] FPS {frequency}")
-
-                # fetch command from queue
-                try:
-                    commands = self.command_queue.get_all()
-                    n_cmd = len(commands["cmd"])
-                except Empty:
-                    n_cmd = 0
-
-                # execute commands
-                for i in range(n_cmd):
-                    command = dict()
-                    for key, value in commands.items():  # type: ignore
-                        command[key] = value[i]
-                    cmd = command["cmd"]
-                    if cmd == Command.SET_COLOR_OPTION.value:
-                        sensor = pipeline_profile.get_device().first_color_sensor()
-                        option = rs.option(command["option_enum"])
-                        value = float(command["option_value"])
-                        sensor.set_option(option, value)
-                        # print('auto', sensor.get_option(rs.option.enable_auto_exposure))
-                        # print('exposure', sensor.get_option(rs.option.exposure))
-                        # print('gain', sensor.get_option(rs.option.gain))
-                    elif cmd == Command.SET_DEPTH_OPTION.value:
-                        sensor = pipeline_profile.get_device().first_depth_sensor()
-                        option = rs.option(command["option_enum"])
-                        value = float(command["option_value"])
-                        sensor.set_option(option, value)
-                    elif cmd == Command.START_RECORDING.value:
-                        video_path = str(command["video_path"])
-                        start_time = command["recording_start_time"]
-                        self.recording_stopped.clear()
-                        self.record_start_time = start_time
-                        self.video_recorder.start(video_path)
-                    elif cmd == Command.STOP_RECORDING.value:
-                        self.video_recorder.stop()
-                        self.recording_stopped.set()
-                        # stop need to flush all in-flight frames to disk, which might take longer than dt.
-                        # soft-reset put to drop frames to prevent ring buffer overflow.
-                        put_idx = None
-                    elif cmd == Command.RESTART_PUT.value:
-                        put_idx = None
-                        put_start_time = command["put_start_time"]
-                        # self.ring_buffer.clear()
-
-                iter_idx += 1
+                    iter_idx += 1
         finally:
             self.video_recorder.stop()
             rs_config.disable_all_streams()
