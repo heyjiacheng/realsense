@@ -194,6 +194,11 @@ class MultiRealsense:
     def allocate_empty(self):
         return {serial: c.allocate_empty() for serial, c in self.cameras.items()}
 
+    def wait_for_recording_to_stop(self):
+        for i, camera in enumerate(self.cameras.values()):
+            if camera.recording_stopped.is_set():
+                camera.recording_stopped.wait()
+
     def start_recording(self, video_path: str, start_time: float):
         # if isinstance(video_path, str):
         #     # directory

@@ -29,11 +29,9 @@ class VideoRecorder:
         # self.x265_params = '-x265-params "lossless=1 -p=ultrafast -tune=zerolatency"'
         # self.x265_params = '-x265-params "lossless=1 -tune=zerolatency"'
         self.x265_params = "-preset lossless"
-        # self.x265_params = '-x265-params -lossless=1'
         if VideoRecorder.hevc_nvenc_counter <= VideoRecorder.hevc_nvenc_limit:
             VideoRecorder.hevc_nvenc_counter += 1
             encoder = "hevc_nvenc"
-            print(f"Using nvenc encoder {VideoRecorder.hevc_nvenc_counter}")
         else:
             encoder = "hevc"
 
@@ -42,13 +40,12 @@ class VideoRecorder:
         )
         self.writer = None
         self.timestamps = []
-        self.start_time = 0.0
         self.path = None
 
     def is_ready(self):
         return self.writer is not None
 
-    def start(self, path: Path, start_time: float = 0.0):
+    def start(self, path: Path | str):
         if isinstance(path, str):
             path = Path(path)
         assert self.writer is None
@@ -56,24 +53,22 @@ class VideoRecorder:
         self.writer = sp.Popen(
             shlex.split(self.get_command(path)), stdout=sp.DEVNULL, stdin=sp.PIPE
         )
-        self.start_time = start_time
         self.timestamps = []
 
     def write_frame(self, data: np.ndarray, frame_time: float):
         assert self.writer is not None
         assert self.width == data.shape[1] and self.height == data.shape[0]
         self.timestamps.append(frame_time)
-        self.writer.stdin.write(data.tobytes())
+        self.writer.stdin.write(data.tobytes())  # type: ignore
         self.frame_counter += 1
 
     def stop(self):
         if self.writer is None:
             return
-        self.writer.stdin.close()
+        self.writer.stdin.close()  # type: ignore
         # self.writer.wait()
         self.writer.terminate()
         self.writer = None
-        with open(self.path.with_suffix(".txt"), "w") as f:
-            for t in self.timestamps:
-                f.write(f"{t}\n")
-
+        # with open(self.path.with_suffix(".txt"), "w") as f:
+        #     for t in self.timestamps:
+        #         f.write(f"{t}\n")

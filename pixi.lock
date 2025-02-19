@@ -1264,13 +1264,13 @@ packages:
 - pypi: .
   name: realsense
   version: 1.0.1
-  sha256: e58b86b9004c0aec60750b1bafae29be81fdb8468f0841cd6d9503d8a407d417
+  sha256: 96d774fd1e0e833b1173aabaa244cbf0ac93996368ca286d36001899cf926b81
   requires_dist:
   - pyrealsense2
   - numpy
   - threadpoolctl
   - shared-memory @ git+https://github.com/jc211/shared_memory
-  requires_python: '>=3.10,<3.12'
+  requires_python: '>=3.10,<3.13'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/noarch/setuptools-75.6.0-pyhff2d567_1.conda
   sha256: abb12e1dd515b13660aacb5d0fd43835bc2186cab472df25b7716cd65e095111

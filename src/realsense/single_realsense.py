@@ -105,22 +105,7 @@ class SingleRealsense(mp.Process):
         )
         intrinsics_array.get()[:] = 0
 
-        # create video recorder
         if video_recorder is None:
-            # realsense uses bgr24 pixel format
-            # default thread_type to FRAEM
-            # i.e. each frame uses one core
-            # instead of all cores working on all frames.
-            # this prevents CPU over-subpscription and
-            # improves performance significantly
-            # video_recorder = VideoRecorder.create_h264(
-            #     fps=record_fps,
-            #     codec="h264",
-            #     input_pix_fmt="bgr24",
-            #     crf=18,
-            #     thread_type="FRAME",
-            #     thread_count=1,
-            # )
             video_recorder = VideoRecorder(
                 width=resolution[0],
                 height=resolution[1],
@@ -145,10 +130,12 @@ class SingleRealsense(mp.Process):
         self.video_recorder = video_recorder
         self.verbose = verbose
         self.put_start_time = None
+        self.record_start_time = 0.0
 
         # shared variables
         self.stop_event = mp.Event()
         self.ready_event = mp.Event()
+        self.recording_stopped = mp.Event()
         self.ring_buffer = ring_buffer
         self.vis_ring_buffer = vis_ring_buffer
         self.command_queue = command_queue
@@ -258,9 +245,8 @@ class SingleRealsense(mp.Process):
     def allocate_empty(self, k=None):
         return self.ring_buffer._allocate_empty(k=k)
 
-    def start_recording(self, video_path: str, start_time: float = -1):
+    def start_recording(self, video_path: str, start_time: float = 0.0):
         assert self.enable_color
-
         path_len = len(video_path.encode("utf-8"))
         if path_len > self.MAX_PATH_LENGTH:
             raise RuntimeError("video_path too long.")
@@ -279,6 +265,11 @@ class SingleRealsense(mp.Process):
         self.command_queue.put(
             {"cmd": Command.RESTART_PUT.value, "put_start_time": start_time}
         )
+
+    def wait_for_recording_to_stop(self):
+        assert self.ready_event.is_set()
+        if self.recording_stopped.is_set():
+            self.recording_stopped.wait()
 
     # ========= interval API ===========
     def run(self):
@@ -428,7 +419,8 @@ class SingleRealsense(mp.Process):
 
                 if self.video_recorder.is_ready():
                     self.video_recorder.write_frame(
-                        rec_data["color"], frame_time=receive_time
+                        rec_data["color"],
+                        frame_time=receive_time - self.record_start_time,
                     )
 
                 # perf
@@ -449,7 +441,7 @@ class SingleRealsense(mp.Process):
                 # execute commands
                 for i in range(n_cmd):
                     command = dict()
-                    for key, value in commands.items():
+                    for key, value in commands.items():  # type: ignore
                         command[key] = value[i]
                     cmd = command["cmd"]
                     if cmd == Command.SET_COLOR_OPTION.value:
@@ -468,11 +460,12 @@ class SingleRealsense(mp.Process):
                     elif cmd == Command.START_RECORDING.value:
                         video_path = str(command["video_path"])
                         start_time = command["recording_start_time"]
-                        if start_time < 0:
-                            start_time = None
-                        self.video_recorder.start(video_path, start_time=start_time)
+                        self.recording_stopped.clear()
+                        self.record_start_time = start_time
+                        self.video_recorder.start(video_path)
                     elif cmd == Command.STOP_RECORDING.value:
                         self.video_recorder.stop()
+                        self.recording_stopped.set()
                         # stop need to flush all in-flight frames to disk, which might take longer than dt.
                         # soft-reset put to drop frames to prevent ring buffer overflow.
                         put_idx = None
