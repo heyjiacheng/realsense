@@ -35,8 +35,11 @@ class VideoRecorder:
         else:
             encoder = "hevc"
 
+        # self.get_command = (
+        #     lambda path: f"ffmpeg {self.loglevel} -threads 1 -y -s {self.width}x{self.height}  -pixel_format {input_pix_fmt} -f rawvideo -r {self.fps} -i pipe: -vcodec {encoder} -pix_fmt yuv420p {path} {self.x265_params}"
+        # )
         self.get_command = (
-            lambda path: f"ffmpeg {self.loglevel} -threads 1 -y -s {self.width}x{self.height}  -pixel_format {input_pix_fmt} -f rawvideo -r {self.fps} -i pipe: -vcodec {encoder} -pix_fmt yuv420p {path} {self.x265_params}"
+            lambda path: f"ffmpeg {self.loglevel} -threads 1 -y -s {self.width}x{self.height}  -pixel_format {input_pix_fmt} -f rawvideo -r {self.fps} -i pipe: -vcodec {encoder} -force_key_frames expr:gte(n,0) -pix_fmt yuv420p {path} {self.x265_params}"
         )
         self.writer = None
         self.timestamps = []
