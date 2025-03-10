@@ -72,3 +72,7 @@ class VideoRecorder:
         # with open(self.path.with_suffix(".txt"), "w") as f:
         #     for t in self.timestamps:
         #         f.write(f"{t}\n")
+
+    def __del__(self):
+        # decrement the hevc_nvenc_counter
+        VideoRecorder.hevc_nvenc_counter -= 1
