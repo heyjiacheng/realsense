@@ -9,7 +9,7 @@ dependencies = [
 "numpy",
 "threadpoolctl",
 "shared_memory@git+https://github.com/jc211/shared_memory"
-]
+, "opencv-python>=4.11.0.86,<5"]
 
 [build-system]
 build-backend = "hatchling.build"

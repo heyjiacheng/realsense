@@ -310,8 +310,14 @@ class SingleRealsense(mp.Process):
 
             # report global time
             # https://github.com/IntelRealSense/librealsense/pull/3909
-            d = pipeline_profile.get_device().first_color_sensor()
-            d.set_option(rs.option.global_time_enabled, 1)
+            try:
+                # 尝试获取颜色传感器（对于普通D4xx相机）
+                d = pipeline_profile.get_device().first_color_sensor()
+                d.set_option(rs.option.global_time_enabled, 1)
+            except RuntimeError:
+                # 对于D405，使用深度/红外传感器
+                d = pipeline_profile.get_device().first_depth_sensor()
+                d.set_option(rs.option.global_time_enabled, 1)
 
             # setup advanced mode
             if self.advanced_mode_config is not None:
@@ -359,11 +365,12 @@ class SingleRealsense(mp.Process):
                     data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
                     if self.enable_color:
                         color_frame = frameset.get_color_frame()
+                        if not color_frame:
+                            print(f"[SingleRealsense {self.serial_number}] Warning: No color frame available")
+                            continue
                         data["color"] = np.asarray(color_frame.get_data())
                         t = color_frame.get_timestamp() / 1000
                         data["camera_capture_timestamp"] = t
-                        # print('device', time.time() - t)
-                        # print(color_frame.get_frame_timestamp_domain())
                     if self.enable_depth:
                         data["depth"] = np.asarray(
                             frameset.get_depth_frame().get_data()
