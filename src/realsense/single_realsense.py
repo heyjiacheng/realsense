@@ -291,44 +291,80 @@ class SingleRealsense(mp.Process):
 
         w, h = self.resolution
         fps = self.capture_fps
-        align = rs.align(rs.stream.color)
         # Enable the streams from all the intel realsense devices
         rs_config = rs.config()
-        if self.enable_color:
-            rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
-        if self.enable_depth:
-            rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-        if self.enable_infrared:
-            rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
+        
+        # First check if the device is available and get its info
+        rs_config.enable_device(self.serial_number)
+        device = rs.context().devices[0]
+        product_name = device.get_info(rs.camera_info.name)
+        print(f"Product name: {product_name}")
+        
+        if product_name == "Intel RealSense D405":
+            # For D405, we primarily use depth/infrared
+            if self.enable_depth:
+                rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+            if self.enable_infrared:
+                rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
+            # D405 might not support color stream, but we'll try if requested
+            if self.enable_color:
+                try:
+                    rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
+                except RuntimeError as e:
+                    print(f"[SingleRealsense {self.serial_number}] Warning: Could not enable color stream for D405: {e}")
+                    self.enable_color = False
+        else:
+            # For other cameras like D435
+            if self.enable_color:
+                rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
+            if self.enable_depth:
+                rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+            if self.enable_infrared:
+                rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
 
         try:
-            rs_config.enable_device(self.serial_number)
-
             # start pipeline
             pipeline = rs.pipeline()
             pipeline_profile = pipeline.start(rs_config)
 
+            # Get device info
+            device = pipeline_profile.get_device()
+            product_line = device.get_info(rs.camera_info.product_line)
+            product_name = device.get_info(rs.camera_info.name)
+            
+            # Set up frame alignment
+            if product_name == "Intel RealSense D405":
+                align = rs.align(rs.stream.depth)  # Align to depth for D405
+            else:
+                align = rs.align(rs.stream.color)  # Align to color for other cameras
+
             # report global time
             # https://github.com/IntelRealSense/librealsense/pull/3909
-            try:
-                # 尝试获取颜色传感器（对于普通D4xx相机）
-                d = pipeline_profile.get_device().first_color_sensor()
+            if product_name == "Intel RealSense D405":
+                # For D405, use depth/infrared sensor
+                d = device.first_depth_sensor()
                 d.set_option(rs.option.global_time_enabled, 1)
-            except RuntimeError:
-                # 对于D405，使用深度/红外传感器
-                d = pipeline_profile.get_device().first_depth_sensor()
+            else:
+                # For other D4xx cameras like D435, use color sensor
+                d = device.first_color_sensor()
                 d.set_option(rs.option.global_time_enabled, 1)
 
             # setup advanced mode
             if self.advanced_mode_config is not None:
                 json_text = json.dumps(self.advanced_mode_config)
-                device = pipeline_profile.get_device()
                 advanced_mode = rs.rs400_advanced_mode(device)
                 advanced_mode.load_json(json_text)
 
-            # get
-            color_stream = pipeline_profile.get_stream(rs.stream.color)
-            intr = color_stream.as_video_stream_profile().get_intrinsics()
+            # get intrinsics
+            if self.enable_color:
+                try:
+                    color_stream = pipeline_profile.get_stream(rs.stream.color)
+                    intr = color_stream.as_video_stream_profile().get_intrinsics()
+                except RuntimeError:
+                    # If color stream is not available, try depth stream
+                    depth_stream = pipeline_profile.get_stream(rs.stream.depth)
+                    intr = depth_stream.as_video_stream_profile().get_intrinsics()
+
             order = ["fx", "fy", "ppx", "ppy", "height", "width"]
             for i, name in enumerate(order):
                 self.intrinsics_array.get()[i] = getattr(intr, name)
@@ -364,13 +400,32 @@ class SingleRealsense(mp.Process):
                     # realsense report in ms
                     data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
                     if self.enable_color:
-                        color_frame = frameset.get_color_frame()
-                        if not color_frame:
-                            print(f"[SingleRealsense {self.serial_number}] Warning: No color frame available")
-                            continue
-                        data["color"] = np.asarray(color_frame.get_data())
-                        t = color_frame.get_timestamp() / 1000
-                        data["camera_capture_timestamp"] = t
+                        try:
+                            color_frame = frameset.get_color_frame()
+                            if not color_frame:
+                                if product_name == "Intel RealSense D405":
+                                    # For D405, if color is not available, use infrared as color
+                                    infrared_frame = frameset.get_infrared_frame()
+                                    if not infrared_frame:
+                                        print(f"[SingleRealsense {self.serial_number}] Warning: No infrared frame available")
+                                        continue
+                                    # Convert infrared to BGR format
+                                    data["color"] = np.repeat(np.asarray(infrared_frame.get_data())[..., np.newaxis], 3, axis=2)
+                                    t = infrared_frame.get_timestamp() / 1000
+                                else:
+                                    print(f"[SingleRealsense {self.serial_number}] Warning: No color frame available")
+                                    continue
+                            else:
+                                data["color"] = np.asarray(color_frame.get_data())
+                                t = color_frame.get_timestamp() / 1000
+                            data["camera_capture_timestamp"] = t
+                        except RuntimeError as e:
+                            if product_name == "Intel RealSense D405":
+                                # For D405, silently continue without color
+                                pass
+                            else:
+                                print(f"[SingleRealsense {self.serial_number}] Error getting color frame: {e}")
+                                continue
                     if self.enable_depth:
                         data["depth"] = np.asarray(
                             frameset.get_depth_frame().get_data()
@@ -470,13 +525,12 @@ class SingleRealsense(mp.Process):
                             command[key] = value[i]
                         cmd = command["cmd"]
                         if cmd == Command.SET_COLOR_OPTION.value:
+                            if product_name == "Intel RealSense D405":
+                                continue
                             sensor = pipeline_profile.get_device().first_color_sensor()
                             option = rs.option(command["option_enum"])
                             value = float(command["option_value"])
                             sensor.set_option(option, value)
-                            # print('auto', sensor.get_option(rs.option.enable_auto_exposure))
-                            # print('exposure', sensor.get_option(rs.option.exposure))
-                            # print('gain', sensor.get_option(rs.option.gain))
                         elif cmd == Command.SET_DEPTH_OPTION.value:
                             sensor = pipeline_profile.get_device().first_depth_sensor()
                             option = rs.option(command["option_enum"])
