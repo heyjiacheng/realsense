@@ -39,7 +39,8 @@ class SingleRealsense(mp.Process):
         enable_color=True,
         enable_depth=False,
         enable_infrared=False,
-        get_max_k=30,
+        get_max_k=60,  # 增加缓冲区大小
+        get_time_budget=0.5, # 增加时间预算
         advanced_mode_config=None,
         transform: Optional[Callable[[Dict], Dict]] = None,
         vis_transform: Optional[Callable[[Dict], Dict]] = None,
@@ -83,7 +84,7 @@ class SingleRealsense(mp.Process):
             shm_manager=shm_manager,
             examples=examples if transform is None else transform(dict(examples)),
             get_max_k=get_max_k,
-            get_time_budget=0.2,
+            get_time_budget=get_time_budget, # 使用传入的参数
             put_desired_frequency=put_fps,
         )
 
@@ -291,30 +292,65 @@ class SingleRealsense(mp.Process):
 
         w, h = self.resolution
         fps = self.capture_fps
-        # Enable the streams from all the intel realsense devices
-        rs_config = rs.config()
         
         # First check if the device is available and get its info
+        rs_config = rs.config()
         rs_config.enable_device(self.serial_number)
-        device = rs.context().devices[0]
-        product_name = device.get_info(rs.camera_info.name)
-        print(f"Product name: {product_name}")
         
+        # Get product name to handle D405 specifics
+        context = rs.context()
+        devices = {d.get_info(rs.camera_info.serial_number): d for d in context.query_devices()}
+        device_obj = devices.get(self.serial_number)
+        
+        if device_obj is None:
+            print(f"[SingleRealsense {self.serial_number}] Error: Device not found.")
+            return
+            
+        product_name = device_obj.get_info(rs.camera_info.name)
+        print(f"[SingleRealsense {self.serial_number}] Product name: {product_name}")
+        
+        # Store original requests from constructor for clarity in logic
+        original_enable_color_req = self.enable_color
+        original_enable_depth_req = self.enable_depth
+        original_enable_infrared_req = self.enable_infrared
+
         if product_name == "Intel RealSense D405":
-            # For D405, we primarily use depth/infrared
-            if self.enable_depth:
+            # print(f"[SingleRealsense {self.serial_number}] D405: Applying D405-specific stream configuration.")
+            # We will modify self.enable_color and self.enable_infrared instance flags based on what we can realistically provide.
+            
+            d405_provides_depth = False
+            d405_provides_color_via_ir = False
+            d405_provides_direct_ir = False
+
+            if original_enable_depth_req:
+                # print(f"[SingleRealsense {self.serial_number}] D405: Configuring Depth stream ({w}x{h}@{fps}fps).")
                 rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-            if self.enable_infrared:
+                d405_provides_depth = True
+            
+            if original_enable_color_req:
+                # print(f"[SingleRealsense {self.serial_number}] D405: Color requested. Will use Infrared stream as color source for stability.")
+                # print(f"[SingleRealsense {self.serial_number}] D405: Configuring Infrared stream ({w}x{h}@{fps}fps) for color data.")
                 rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
-            # D405 might not support color stream, but we'll try if requested
-            if self.enable_color:
-                try:
-                    rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
-                except RuntimeError as e:
-                    print(f"[SingleRealsense {self.serial_number}] Warning: Could not enable color stream for D405: {e}")
-                    self.enable_color = False
-        else:
-            # For other cameras like D435
+                self.enable_infrared = True # Ensure IR frame is available for fallback in frame loop
+                d405_provides_color_via_ir = True
+                d405_provides_direct_ir = True # IR stream is now active
+            elif original_enable_infrared_req: # Color not requested, but IR was
+                # print(f"[SingleRealsense {self.serial_number}] D405: Infrared stream requested (no color request).")
+                # print(f"[SingleRealsense {self.serial_number}] D405: Configuring Infrared stream ({w}x{h}@{fps}fps).")
+                rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
+                self.enable_infrared = True # Ensure IR frame is available
+                d405_provides_direct_ir = True
+
+            # Update instance's self.enable_color flag based on whether we plan to provide color (via IR)
+            self.enable_color = d405_provides_color_via_ir
+            # self.enable_depth remains original_enable_depth_req
+            # self.enable_infrared has been updated if IR stream was configured
+
+            if not d405_provides_depth and not d405_provides_color_via_ir and not d405_provides_direct_ir:
+                print(f"[SingleRealsense {self.serial_number}] D405: WARNING - No streams configured based on requests.")
+
+        else: # For other cameras like D435
+            # print(f"[SingleRealsense {self.serial_number}] {product_name}: Applying standard stream configuration.")
             if self.enable_color:
                 rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
             if self.enable_depth:
@@ -327,27 +363,66 @@ class SingleRealsense(mp.Process):
             pipeline = rs.pipeline()
             pipeline_profile = pipeline.start(rs_config)
 
-            # Get device info
+            # Get device info from pipeline_profile for robustness
             device = pipeline_profile.get_device()
-            product_line = device.get_info(rs.camera_info.product_line)
-            product_name = device.get_info(rs.camera_info.name)
             
-            # Set up frame alignment
+            # Set up frame alignment - MUST be done AFTER pipeline.start() and with correct profile
+            # And align target stream must be one that was successfully enabled.
+            align_to_stream = None
             if product_name == "Intel RealSense D405":
-                align = rs.align(rs.stream.depth)  # Align to depth for D405
-            else:
-                align = rs.align(rs.stream.color)  # Align to color for other cameras
+                if original_enable_depth_req: # Check original request for depth
+                    # print(f"[SingleRealsense {self.serial_number}] D405: Aligning to Depth stream.")
+                    align_to_stream = rs.stream.depth
+                elif original_enable_color_req or original_enable_infrared_req: # If depth not primary, but IR (for color or direct) is
+                    # print(f"[SingleRealsense {self.serial_number}] D405: Aligning to Infrared stream.")
+                    align_to_stream = rs.stream.infrared
+                else:
+                    # print(f"[SingleRealsense {self.serial_number}] D405: Warning - No primary alignment stream, defaulting to Depth for align object.")
+                    align_to_stream = rs.stream.depth 
+            else: # For other cameras, align to color if available, else depth
+                if original_enable_color_req:
+                    # print(f"[SingleRealsense {self.serial_number}] {product_name}: Aligning to Color stream.")
+                    align_to_stream = rs.stream.color
+                elif original_enable_depth_req:
+                    # print(f"[SingleRealsense {self.serial_number}] {product_name}: Color not enabled, aligning to Depth stream.")
+                    align_to_stream = rs.stream.depth
+                elif original_enable_infrared_req: # Added this condition for non-D405 IR alignment
+                    # print(f"[SingleRealsense {self.serial_number}] {product_name}: Warning - No color/depth for alignment, aligning to Infrared.")
+                    align_to_stream = rs.stream.infrared
+                else:
+                    # print(f"[SingleRealsense {self.serial_number}] {product_name}: Warning - No color/depth/IR for alignment, defaulting to first available or None.")
+                    # Attempt to find any enabled stream for alignment as a last resort for non-D405
+                    try:
+                        if pipeline_profile.get_stream(rs.stream.color):
+                            align_to_stream = rs.stream.color
+                        elif pipeline_profile.get_stream(rs.stream.depth):
+                            align_to_stream = rs.stream.depth
+                        elif pipeline_profile.get_stream(rs.stream.infrared):
+                            align_to_stream = rs.stream.infrared
+                    except RuntimeError: # If get_stream fails because it doesn't exist
+                        pass # align_to_stream remains None or its previous value
+
+            align = rs.align(align_to_stream) if align_to_stream else None
+            if not align and (original_enable_depth_req or original_enable_color_req or original_enable_infrared_req): # Only warn if streams were expected
+                print(f"[SingleRealsense {self.serial_number}] Warning: Alignment object could not be created. Alignment will be skipped.")
 
             # report global time
-            # https://github.com/IntelRealSense/librealsense/pull/3909
+            sensor_to_set = None
             if product_name == "Intel RealSense D405":
-                # For D405, use depth/infrared sensor
-                d = device.first_depth_sensor()
-                d.set_option(rs.option.global_time_enabled, 1)
-            else:
-                # For other D4xx cameras like D435, use color sensor
-                d = device.first_color_sensor()
-                d.set_option(rs.option.global_time_enabled, 1)
+                if original_enable_depth_req and device.first_depth_sensor():
+                    sensor_to_set = device.first_depth_sensor() 
+                elif (original_enable_color_req or original_enable_infrared_req) and device.first_infrared_sensor(): # D405 color uses IR
+                    sensor_to_set = device.first_infrared_sensor()
+            else: # For other D4xx cameras like D435
+                if original_enable_color_req and device.first_color_sensor():
+                    sensor_to_set = device.first_color_sensor()
+                elif original_enable_depth_req and device.first_depth_sensor(): # Fallback if color not enabled/found
+                    sensor_to_set = device.first_depth_sensor()
+            
+            if sensor_to_set:
+                 sensor_to_set.set_option(rs.option.global_time_enabled, 1)
+            # else:
+                # print(f"[SingleRealsense {self.serial_number}] Warning: Could not get sensor to set global_time_enabled.")
 
             # setup advanced mode
             if self.advanced_mode_config is not None:
@@ -356,25 +431,42 @@ class SingleRealsense(mp.Process):
                 advanced_mode.load_json(json_text)
 
             # get intrinsics
-            if self.enable_color:
-                try:
-                    color_stream = pipeline_profile.get_stream(rs.stream.color)
-                    intr = color_stream.as_video_stream_profile().get_intrinsics()
-                except RuntimeError:
-                    # If color stream is not available, try depth stream
-                    depth_stream = pipeline_profile.get_stream(rs.stream.depth)
-                    intr = depth_stream.as_video_stream_profile().get_intrinsics()
+            stream_for_intrinsics = None
+            # Priority: Color (if enabled), then Depth (if enabled), then Infrared (if enabled for D405 color/IR)
+            if original_enable_color_req and not (product_name == "Intel RealSense D405"): # True color stream
+                 try:
+                    stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.color)
+                 except RuntimeError:
+                    pass # print(f"[SingleRealsense {self.serial_number}] Warning: Color stream not found for intrinsics (non-D405).")
+            
+            if not stream_for_intrinsics and original_enable_depth_req:
+                 try:
+                    stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.depth)
+                 except RuntimeError:
+                    pass # print(f"[SingleRealsense {self.serial_number}] Warning: Depth stream not found for intrinsics.")
 
-            order = ["fx", "fy", "ppx", "ppy", "height", "width"]
-            for i, name in enumerate(order):
-                self.intrinsics_array.get()[i] = getattr(intr, name)
+            if not stream_for_intrinsics and (product_name == "Intel RealSense D405") and (original_enable_color_req or original_enable_infrared_req): # D405 uses IR for color
+                 try:
+                    stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.infrared)
+                 except RuntimeError:
+                    pass # print(f"[SingleRealsense {self.serial_number}] Warning: Infrared stream not found for intrinsics (D405 color/IR mode).")
+            
+            if stream_for_intrinsics:
+                intr = stream_for_intrinsics.as_video_stream_profile().get_intrinsics()
+                order = ["fx", "fy", "ppx", "ppy", "height", "width"]
+                for i, name in enumerate(order):
+                    self.intrinsics_array.get()[i] = getattr(intr, name)
+            else:
+                 print(f"[SingleRealsense {self.serial_number}] Error: Could not get intrinsics from any enabled stream.")
 
-            if self.enable_depth:
-                depth_sensor = pipeline_profile.get_device().first_depth_sensor()
-                depth_scale = depth_sensor.get_depth_scale()
-                self.intrinsics_array.get()[-1] = depth_scale
+            if original_enable_depth_req: # Check original request
+                depth_sensor = device.first_depth_sensor()
+                if depth_sensor:
+                    depth_scale = depth_sensor.get_depth_scale()
+                    self.intrinsics_array.get()[-1] = depth_scale
+                # else:
+                    # print(f"[SingleRealsense {self.serial_number}] Warning: Could not get depth sensor for depth_scale.")
 
-            # one-time setup (intrinsics etc, ignore for now)
             if self.verbose:
                 print(f"[SingleRealsense {self.serial_number}] Main loop started.")
 
@@ -386,57 +478,99 @@ class SingleRealsense(mp.Process):
 
             iter_idx = 0
             t_start = time.time()
+
+            # Create placeholders for data if streams are expected by ring buffer
+            empty_color_placeholder = None
+            if original_enable_color_req:
+                empty_color_placeholder = np.zeros(self.resolution[::-1] + (3,), dtype=np.uint8)
+            
+            empty_ir_placeholder = None
+            if original_enable_infrared_req:
+                empty_ir_placeholder = np.zeros(self.resolution[::-1], dtype=np.uint8)
+
             with ThreadPoolExecutor(max_workers=2) as exec:
                 while not self.stop_event.is_set():
-                    # wait for frames to come in
-                    frameset = pipeline.wait_for_frames()
+                    try:
+                        frameset = pipeline.wait_for_frames(timeout_ms=4000) 
+                    except RuntimeError as e:
+                        if "Frame didn't arrive within" in str(e):
+                            print(f"[SingleRealsense {self.serial_number}] Warning: Frame timeout. Skipping frame acquisition for this cycle.")
+                            continue 
+                        else:
+                            print(f"[SingleRealsense {self.serial_number}] RuntimeError in wait_for_frames: {e}")
+                            raise 
+                            
+                    if not frameset:
+                        # print(f"[SingleRealsense {self.serial_number}] Warning: Empty frameset received.")
+                        continue
+                        
                     receive_time = time.time()
-                    # align frames to color
-                    frameset = align.process(frameset)
-
+                    
+                    if align:
+                        try:
+                            frameset = align.process(frameset)
+                        except Exception as e:
+                            print(f"[SingleRealsense {self.serial_number}] Error during align.process: {e}. Using unaligned frameset.")
+                            # frameset remains unaligned
                     # grab data
                     data = dict()
                     data["camera_receive_timestamp"] = receive_time
-                    # realsense report in ms
-                    data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
-                    if self.enable_color:
+                    data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000 # ms to s
+
+                    # Initialize with placeholders if streams were originally requested
+                    if original_enable_color_req:
+                        data["color"] = empty_color_placeholder
+                    if original_enable_infrared_req:
+                        data["infrared"] = empty_ir_placeholder
+                    
+                    color_frame_data = None # Temp variable to hold actual color data if found
+                    if self.enable_color: # This is the instance flag, possibly modified for D405 IR-as-color
                         try:
                             color_frame = frameset.get_color_frame()
-                            if not color_frame:
-                                if product_name == "Intel RealSense D405":
-                                    # For D405, if color is not available, use infrared as color
-                                    infrared_frame = frameset.get_infrared_frame()
-                                    if not infrared_frame:
-                                        print(f"[SingleRealsense {self.serial_number}] Warning: No infrared frame available")
-                                        continue
-                                    # Convert infrared to BGR format
-                                    data["color"] = np.repeat(np.asarray(infrared_frame.get_data())[..., np.newaxis], 3, axis=2)
-                                    t = infrared_frame.get_timestamp() / 1000
-                                else:
-                                    print(f"[SingleRealsense {self.serial_number}] Warning: No color frame available")
-                                    continue
-                            else:
-                                data["color"] = np.asarray(color_frame.get_data())
-                                t = color_frame.get_timestamp() / 1000
-                            data["camera_capture_timestamp"] = t
+                            if color_frame:
+                                color_frame_data = np.asarray(color_frame.get_data())
+                                data["camera_capture_timestamp"] = color_frame.get_timestamp() / 1000
+                            elif product_name == "Intel RealSense D405" and self.enable_infrared: # D405 IR-as-color fallback
+                                infrared_frame_for_color = frameset.get_infrared_frame()
+                                if infrared_frame_for_color:
+                                    ir_data = np.asarray(infrared_frame_for_color.get_data())
+                                    color_frame_data = np.repeat(ir_data[..., np.newaxis], 3, axis=2)
+                                    data["camera_capture_timestamp"] = infrared_frame_for_color.get_timestamp() / 1000 
+                                # else:
+                                    # if self.verbose and original_enable_color_req:
+                                        # print(f"[SingleRealsense {self.serial_number}] Warning: D405 IR fallback for color: No IR frame.")
+                            elif original_enable_color_req: 
+                                 if self.verbose:
+                                    print(f"[SingleRealsense {self.serial_number}] Warning: No color frame, but color was expected.")
+
+                            if color_frame_data is not None and original_enable_color_req:
+                                data["color"] = color_frame_data 
+                            elif color_frame_data is None and original_enable_color_req:
+                                if self.verbose: print(f"[SingleRealsense {self.serial_number}] Using placeholder for color frame.")
+
                         except RuntimeError as e:
-                            if product_name == "Intel RealSense D405":
-                                # For D405, silently continue without color
-                                pass
-                            else:
-                                print(f"[SingleRealsense {self.serial_number}] Error getting color frame: {e}")
-                                continue
-                    if self.enable_depth:
-                        data["depth"] = np.asarray(
-                            frameset.get_depth_frame().get_data()
-                        )
-                    if self.enable_infrared:
-                        data["infrared"] = np.asarray(
-                            frameset.get_infrared_frame().get_data()
-                        )
+                            if original_enable_color_req: 
+                                print(f"[SingleRealsense {self.serial_number}] Error getting color frame: {e}. Placeholder will be used if color expected.")
+                    
+                    if self.enable_depth: 
+                        depth_frame = frameset.get_depth_frame()
+                        if depth_frame:
+                            data["depth"] = np.asarray(depth_frame.get_data())
+                        elif original_enable_depth_req: 
+                            if "depth" not in data: 
+                                data["depth"] = np.zeros(self.resolution[::-1], dtype=np.uint16)
+                                if self.verbose: print(f"[SingleRealsense {self.serial_number}] Warning: No depth frame, using placeholder.")
+
+                    if self.enable_infrared: 
+                        infrared_frame_direct = frameset.get_infrared_frame()
+                        if infrared_frame_direct:
+                            if original_enable_infrared_req: 
+                                data["infrared"] = np.asarray(infrared_frame_direct.get_data()) 
+                        elif original_enable_infrared_req: 
+                            if self.verbose: print(f"[SingleRealsense {self.serial_number}] Using placeholder for direct infrared frame.")
 
                     # apply transform
-                    put_data = data
+                    put_data = data.copy() # Use a copy to avoid modifying original data
                     if self.transform is not None:
                         put_data = self.transform(dict(data))
 
@@ -447,26 +581,21 @@ class SingleRealsense(mp.Process):
                                 timestamps=[receive_time],
                                 start_time=put_start_time,
                                 dt=1 / self.put_fps,
-                                # this is non in first iteration
-                                # and then replaced with a concrete number
                                 next_global_idx=put_idx,
-                                # continue to pump frames even if not started.
-                                # start_time is simply used to align timestamps.
                                 allow_negative=True,
                             )
                         )
 
                         for step_idx in global_idxs:
                             put_data["step_idx"] = step_idx
-                            # put_data['timestamp'] = put_start_time + step_idx / self.put_fps
                             put_data["timestamp"] = receive_time
-                            # print(step_idx, data['timestamp'])
                             try:
                                 self.ring_buffer.put(put_data, wait=False)
                             except TimeoutError as e:
-                                print(
-                                    f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
-                                )
+                                if self.verbose:
+                                    print(
+                                        f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+                                    )
                     else:
                         step_idx = int((receive_time - put_start_time) * self.put_fps)
                         put_data["step_idx"] = step_idx
@@ -474,34 +603,53 @@ class SingleRealsense(mp.Process):
                         try:
                             self.ring_buffer.put(put_data, wait=False)
                         except TimeoutError as e:
-                            print(
-                                f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
-                            )
+                            if self.verbose:
+                                print(
+                                    f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
+                                )
 
                     # signal ready
                     if iter_idx == 0:
                         self.ready_event.set()
 
                     # put to vis
-                    vis_data = data
+                    vis_data = data.copy()
                     if self.vis_transform == self.transform:
-                        vis_data = put_data
+                        vis_data = put_data 
                     elif self.vis_transform is not None:
                         vis_data = self.vis_transform(dict(data))
-                    self.vis_ring_buffer.put(vis_data, wait=False)
+                    
+                    # Ensure vis_data always has expected keys if transforms might remove them
+                    if original_enable_color_req and 'color' not in vis_data and empty_color_placeholder is not None:
+                        vis_data['color'] = empty_color_placeholder
+                    if original_enable_depth_req and 'depth' not in vis_data: # Assuming depth placeholder is zeros(shape, uint16)
+                         vis_data['depth'] = np.zeros(self.resolution[::-1], dtype=np.uint16)
+                    if original_enable_infrared_req and 'infrared' not in vis_data and empty_ir_placeholder is not None:
+                         vis_data['infrared'] = empty_ir_placeholder
+
+                    try:
+                        self.vis_ring_buffer.put(vis_data, wait=False)
+                    except KeyError as e:
+                        print(f"[SingleRealsense {self.serial_number}] KeyError putting to vis_ring_buffer: {e}. Vis_data keys: {list(vis_data.keys())}")
+                    except Exception as e: # Catch other potential errors during vis_ring_buffer put
+                        print(f"[SingleRealsense {self.serial_number}] Error putting to vis_ring_buffer: {e}")
 
                     # record frame
-                    rec_data = data
+                    rec_data = data.copy()
                     if self.recording_transform == self.transform:
                         rec_data = put_data
                     elif self.recording_transform is not None:
                         rec_data = self.recording_transform(dict(data))
 
-                    if self.video_recorder.is_ready():
+                    if self.video_recorder.is_ready() and "color" in rec_data:
                         self.video_recorder.write_frame(
                             rec_data["color"],
                             frame_time=receive_time - self.record_start_time,
                         )
+                    elif self.video_recorder.is_ready() and original_enable_color_req and "color" not in rec_data: # Color was expected but not in rec_data
+                         if self.verbose: print(f"[SingleRealsense {self.serial_number}] Warning: No color data in rec_data to record, but color was expected.")
+                         # Optionally write placeholder if recorder expects frames always
+                         # self.video_recorder.write_frame(empty_color_placeholder, frame_time=receive_time - self.record_start_time)
 
                     # perf
                     t_end = time.time()
@@ -526,16 +674,18 @@ class SingleRealsense(mp.Process):
                         cmd = command["cmd"]
                         if cmd == Command.SET_COLOR_OPTION.value:
                             if product_name == "Intel RealSense D405":
-                                continue
-                            sensor = pipeline_profile.get_device().first_color_sensor()
-                            option = rs.option(command["option_enum"])
-                            value = float(command["option_value"])
-                            sensor.set_option(option, value)
+                                continue # Skip for D405
+                            sensor = device.first_color_sensor()
+                            if sensor:
+                                option = rs.option(command["option_enum"])
+                                value = float(command["option_value"])
+                                sensor.set_option(option, value)
                         elif cmd == Command.SET_DEPTH_OPTION.value:
-                            sensor = pipeline_profile.get_device().first_depth_sensor()
-                            option = rs.option(command["option_enum"])
-                            value = float(command["option_value"])
-                            sensor.set_option(option, value)
+                            sensor = device.first_depth_sensor()
+                            if sensor:
+                                option = rs.option(command["option_enum"])
+                                value = float(command["option_value"])
+                                sensor.set_option(option, value)
                         elif cmd == Command.START_RECORDING.value:
                             video_path = str(command["video_path"])
                             start_time = command["recording_start_time"]
@@ -544,23 +694,27 @@ class SingleRealsense(mp.Process):
                             self.video_recorder.start(video_path)
                         elif cmd == Command.STOP_RECORDING.value:
                             self.video_recorder.stop()
-                            assert self.video_recorder.path is not None
-                            exec.submit(
-                                self.save_metadata,
-                                self.video_recorder.path.with_suffix(".json"),
-                            )
-                            # stop need to flush all in-flight frames to disk, which might take longer than dt.
-                            # soft-reset put to drop frames to prevent ring buffer overflow.
+                            if self.video_recorder.path is not None:
+                                exec.submit(
+                                    self.save_metadata,
+                                    self.video_recorder.path.with_suffix(".json"),
+                                )
                             put_idx = None
                         elif cmd == Command.RESTART_PUT.value:
                             put_idx = None
                             put_start_time = command["put_start_time"]
-                            # self.ring_buffer.clear()
 
                     iter_idx += 1
+        except Exception as e:
+            print(f"[SingleRealsense {self.serial_number}] Exception in run loop: {e}")
         finally:
             self.video_recorder.stop()
-            rs_config.disable_all_streams()
+            # rs_config.disable_all_streams() # This might be problematic if pipeline is still active
+            if 'pipeline' in locals() and pipeline:
+                try:
+                    pipeline.stop()
+                except Exception as e:
+                    print(f"[SingleRealsense {self.serial_number}] Error stopping pipeline: {e}")
             self.ready_event.set()
 
         if self.verbose:
