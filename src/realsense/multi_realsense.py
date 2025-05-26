@@ -127,7 +127,6 @@ class MultiRealsense:
         
         # For D405 cameras, add extra startup delay
         if has_d405:
-            print("Detected D405 cameras, allowing extra startup time...")
             time.sleep(2)  # Extra delay for D405 stabilization
         
         for camera in self.cameras.values():
