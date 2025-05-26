@@ -107,6 +107,29 @@ class MultiRealsense:
             self.stop_wait()
 
     def start_wait(self):
+        import time
+        
+        # Check for D405 cameras which need longer startup time
+        has_d405 = False
+        try:
+            import pyrealsense2 as rs
+            context = rs.context()
+            devices = {d.get_info(rs.camera_info.serial_number): d for d in context.query_devices()}
+            
+            for serial in self.cameras.keys():
+                if serial in devices:
+                    product_name = devices[serial].get_info(rs.camera_info.name)
+                    if product_name == "Intel RealSense D405":
+                        has_d405 = True
+                        break
+        except:
+            pass  # If we can't check, proceed normally
+        
+        # For D405 cameras, add extra startup delay
+        if has_d405:
+            print("Detected D405 cameras, allowing extra startup time...")
+            time.sleep(2)  # Extra delay for D405 stabilization
+        
         for camera in self.cameras.values():
             camera.start_wait()
 

@@ -396,7 +396,25 @@ class SingleRealsense(mp.Process):
                 else:
                     print(f"[SingleRealsense {self.serial_number}] Warning: Could not get depth sensor for depth_scale.")
 
-            # one-time setup (intrinsics etc, ignore for now)
+            # Camera warmup period - especially important for D405
+            if self.verbose:
+                print(f"[SingleRealsense {self.serial_number}] Warming up camera...")
+                
+            # Let the camera stabilize, especially for D405
+            warmup_frames = 30 if product_name == "Intel RealSense D405" else 10
+            warmup_timeout = 8000 if product_name == "Intel RealSense D405" else 5000
+            
+            for _ in range(warmup_frames):
+                try:
+                    warmup_frameset = pipeline.wait_for_frames(timeout_ms=warmup_timeout)
+                    if warmup_frameset:
+                        break  # Got a frame, camera is ready
+                except RuntimeError as e:
+                    if "Frame didn't arrive" in str(e):
+                        continue  # Keep trying during warmup
+                    else:
+                        raise
+            
             if self.verbose:
                 print(f"[SingleRealsense {self.serial_number}] Main loop started.")
 
@@ -408,15 +426,34 @@ class SingleRealsense(mp.Process):
 
             iter_idx = 0
             t_start = time.time()
+            consecutive_timeouts = 0
+            max_consecutive_timeouts = 5
+            
             with ThreadPoolExecutor(max_workers=2) as exec:
                 while not self.stop_event.is_set():
+                    # Dynamic timeout based on camera type and previous timeouts
+                    if product_name == "Intel RealSense D405":
+                        timeout_ms = 6000 + (consecutive_timeouts * 1000)  # Longer timeout for D405
+                    else:
+                        timeout_ms = 4000 + (consecutive_timeouts * 500)
+                    
+                    # Cap the timeout to prevent it from growing too large
+                    timeout_ms = min(timeout_ms, 15000)
+                    
                     # wait for frames to come in
                     try:
-                        frameset = pipeline.wait_for_frames(timeout_ms=4000) # Add timeout
+                        frameset = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+                        consecutive_timeouts = 0  # Reset counter on success
                     except RuntimeError as e:
-                        if "Frame didn't arrive within 4000" in str(e): # Match the new timeout
-                            print(f"[SingleRealsense {self.serial_number}] Warning: Frame timeout. Skipping frame.")
-                            continue
+                        if "Frame didn't arrive" in str(e):
+                            consecutive_timeouts += 1
+                            if consecutive_timeouts <= max_consecutive_timeouts:
+                                if self.verbose or consecutive_timeouts <= 3:
+                                    print(f"[SingleRealsense {self.serial_number}] Warning: Frame timeout ({consecutive_timeouts}/{max_consecutive_timeouts}). Extending timeout...")
+                                continue
+                            else:
+                                print(f"[SingleRealsense {self.serial_number}] Error: Too many consecutive timeouts ({consecutive_timeouts}). Camera may be disconnected.")
+                                break
                         else:
                             raise # Re-raise other runtime errors
                             
@@ -522,9 +559,11 @@ class SingleRealsense(mp.Process):
                                     f"[SingleRealsense {self.serial_number}] Dumping data - {e}"
                                 )
 
-                    # signal ready
-                    if iter_idx == 0:
+                    # signal ready after getting first few stable frames
+                    if iter_idx == 2:  # Wait for a few frames to ensure stability
                         self.ready_event.set()
+                        if self.verbose:
+                            print(f"[SingleRealsense {self.serial_number}] Camera ready and stable.")
 
                     # put to vis
                     vis_data = data.copy()
