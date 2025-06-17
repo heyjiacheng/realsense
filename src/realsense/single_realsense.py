@@ -342,10 +342,12 @@ class SingleRealsense(mp.Process):
             device = pipeline_profile.get_device()
             
             # 设置帧对齐
-            if is_d405 and self.enable_depth:
-                align = rs.align(rs.stream.depth)  # D405优先深度对齐
-            else:
-                align = rs.align(rs.stream.color)  # 其他情况优先彩色对齐
+            # The stream to which frames will be aligned.
+            # For D405, if color is disabled, align to depth. Otherwise, align to color.
+            align_to_stream_type = rs.stream.color
+            if is_d405 and self.enable_depth and not self.enable_color:
+                align_to_stream_type = rs.stream.depth
+            align = rs.align(align_to_stream_type)
 
             # 设置全局时间
             if is_d405 and self.enable_depth:
@@ -375,32 +377,24 @@ class SingleRealsense(mp.Process):
                     print(f"[SingleRealsense {self.serial_number}] Warning: Could not load advanced mode config: {e}")
 
             # 获取内参
+            # Should be based on the stream we align to, as alignment transforms
+            # other images to the coordinate system of the target stream.
             stream_for_intrinsics = None
-            if is_d405:
-                # D405优先使用深度流
-                if self.enable_depth:
+            try:
+                stream_for_intrinsics = pipeline_profile.get_stream(align_to_stream_type)
+            except RuntimeError:
+                # Fallback to the other stream if the primary one is not available
+                if self.verbose:
+                    print(f"[SingleRealsense {self.serial_number}] "
+                          f"Could not get intrinsics from align stream ({align_to_stream_type}). "
+                          "Attempting fallback.")
+                
+                fallback_stream_type = rs.stream.depth if align_to_stream_type == rs.stream.color else rs.stream.color
+                is_fallback_enabled = self.enable_depth if fallback_stream_type == rs.stream.depth else self.enable_color
+                
+                if is_fallback_enabled:
                     try:
-                        stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.depth)
-                    except RuntimeError:
-                        pass
-            else:
-                # 其他相机优先彩色流
-                if self.enable_color:
-                    try:
-                        stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.color)
-                    except RuntimeError:
-                        pass
-            
-            # 回退方案
-            if stream_for_intrinsics is None:
-                if self.enable_depth:
-                    try:
-                        stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.depth)
-                    except RuntimeError:
-                        pass
-                elif self.enable_color:
-                    try:
-                        stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.color)
+                        stream_for_intrinsics = pipeline_profile.get_stream(fallback_stream_type)
                     except RuntimeError:
                         pass
             
