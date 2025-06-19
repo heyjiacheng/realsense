@@ -311,61 +311,20 @@ class SingleRealsense(mp.Process):
         rs_config = rs.config()
         rs_config.enable_device(self.serial_number)
         
-        # D405特殊处理
-        if is_d405:
-            # 对于D405，优先深度/红外
-            if self.enable_depth:
-                rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-            if self.enable_infrared:
-                rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
-            # D405的彩色流可能不可用，尝试启用
-            if self.enable_color:
-                try:
-                    rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
-                except RuntimeError as e:
-                    if self.verbose:
-                        print(f"[SingleRealsense {self.serial_number}] Could not enable color stream for D405: {e}")
-                    self.enable_color = False
-        else:
-            # 其他D400系列相机
-            if self.enable_color:
-                rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
-            if self.enable_depth:
-                rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-            if self.enable_infrared:
-                rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
+        if self.enable_color:
+            rs_config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
+        if self.enable_depth:
+            rs_config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+        if self.enable_infrared:
+            rs_config.enable_stream(rs.stream.infrared, w, h, rs.format.y8, fps)
 
         try:
             # 启动管道
             pipeline = rs.pipeline()
             pipeline_profile = pipeline.start(rs_config)
             device = pipeline_profile.get_device()
-            
-            # 设置帧对齐
-            # The stream to which frames will be aligned.
-            # For D405, if color is disabled, align to depth. Otherwise, align to color.
-            align_to_stream_type = rs.stream.color
-            if is_d405 and self.enable_depth and not self.enable_color:
-                align_to_stream_type = rs.stream.depth
-            align = rs.align(align_to_stream_type)
 
-            # 设置全局时间
-            if is_d405 and self.enable_depth:
-                # D405优先使用深度传感器
-                sensor_to_set = device.first_depth_sensor()
-            elif self.enable_color:
-                # 其他情况使用彩色传感器
-                sensor_to_set = device.first_color_sensor()
-            else:
-                sensor_to_set = None
-                
-            if sensor_to_set:
-                try:
-                    sensor_to_set.set_option(rs.option.global_time_enabled, 1)
-                except RuntimeError as e:
-                    print(f"[SingleRealsense {self.serial_number}] Warning: Could not set global_time_enabled: {e}")
-            else:
-                print(f"[SingleRealsense {self.serial_number}] Warning: Could not get sensor to set global_time_enabled.")
+            align = rs.align(rs.stream.color) 
 
             # 设置高级模式
             if self.advanced_mode_config is not None:
@@ -377,26 +336,8 @@ class SingleRealsense(mp.Process):
                     print(f"[SingleRealsense {self.serial_number}] Warning: Could not load advanced mode config: {e}")
 
             # 获取内参
-            # Should be based on the stream we align to, as alignment transforms
-            # other images to the coordinate system of the target stream.
             stream_for_intrinsics = None
-            try:
-                stream_for_intrinsics = pipeline_profile.get_stream(align_to_stream_type)
-            except RuntimeError:
-                # Fallback to the other stream if the primary one is not available
-                if self.verbose:
-                    print(f"[SingleRealsense {self.serial_number}] "
-                          f"Could not get intrinsics from align stream ({align_to_stream_type}). "
-                          "Attempting fallback.")
-                
-                fallback_stream_type = rs.stream.depth if align_to_stream_type == rs.stream.color else rs.stream.color
-                is_fallback_enabled = self.enable_depth if fallback_stream_type == rs.stream.depth else self.enable_color
-                
-                if is_fallback_enabled:
-                    try:
-                        stream_for_intrinsics = pipeline_profile.get_stream(fallback_stream_type)
-                    except RuntimeError:
-                        pass
+            stream_for_intrinsics = pipeline_profile.get_stream(rs.stream.color)
             
             if stream_for_intrinsics:
                 intr = stream_for_intrinsics.as_video_stream_profile().get_intrinsics()
@@ -405,18 +346,11 @@ class SingleRealsense(mp.Process):
                     self.intrinsics_array.get()[i] = getattr(intr, name)
             else:
                 print(f"[SingleRealsense {self.serial_number}] Warning: Could not get intrinsics from any stream.")
-            
-            # 获取深度比例
+
             if self.enable_depth:
-                depth_sensor = device.first_depth_sensor()
-                if depth_sensor:
-                    try:
-                        depth_scale = depth_sensor.get_depth_scale()
-                        self.intrinsics_array.get()[-1] = depth_scale
-                    except RuntimeError as e:
-                        print(f"[SingleRealsense {self.serial_number}] Warning: Could not get depth scale: {e}")
-                else:
-                    print(f"[SingleRealsense {self.serial_number}] Warning: Could not get depth sensor for depth_scale.")
+                depth_sensor = pipeline_profile.get_device().first_depth_sensor()
+                depth_scale = depth_sensor.get_depth_scale()
+                self.intrinsics_array.get()[-1] = depth_scale
 
             # 相机预热
             if self.verbose:
@@ -486,44 +420,19 @@ class SingleRealsense(mp.Process):
                     data["camera_receive_timestamp"] = receive_time
                     data["camera_capture_timestamp"] = frameset.get_timestamp() / 1000
                     
-                    # D405彩色处理
-                    if is_d405 and self.enable_color:
+                    # 彩色处理
+                    if self.enable_color:
                         try:
                             # 首先尝试获取彩色帧
                             color_frame = frameset.get_color_frame()
-                            if color_frame:
-                                color_frame_data = np.asarray(color_frame.get_data())
-                                t = color_frame.get_timestamp() / 1000
-                            elif self.enable_infrared:
-                                # 回退到红外转彩色
-                                infrared_frame = frameset.get_infrared_frame()
-                                if infrared_frame:
-                                    ir_data = np.asarray(infrared_frame.get_data())
-                                    # 将红外单通道转为三通道伪彩色
-                                    color_frame_data = np.repeat(ir_data[..., np.newaxis], 3, axis=2)
-                                    t = infrared_frame.get_timestamp() / 1000
-                                else:
-                                    if self.verbose:
-                                        print(f"[SingleRealsense {self.serial_number}] Warning: No infrared frame available for D405 color fallback.")
-                                    color_frame_data = None
-                            else:
-                                color_frame_data = None
+                            color_frame_data = np.asarray(color_frame.get_data())
+                            t = color_frame.get_timestamp() / 1000
                             
-                            if color_frame_data is not None:
-                                data["color"] = color_frame_data
-                                data["camera_capture_timestamp"] = t
+                            data["color"] = color_frame_data
+                            data["camera_capture_timestamp"] = t
                         except RuntimeError as e:
                             if self.verbose:
                                 print(f"[SingleRealsense {self.serial_number}] Error getting D405 color: {e}")
-                    else:
-                        # 非D405处理
-                        if self.enable_color:
-                            try:
-                                color_frame = frameset.get_color_frame()
-                                if color_frame:
-                                    data["color"] = np.asarray(color_frame.get_data())
-                            except RuntimeError as e:
-                                print(f"[SingleRealsense {self.serial_number}] Error getting color frame: {e}")
                     
                     if self.enable_depth:
                         try:
